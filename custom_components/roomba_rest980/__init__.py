@@ -28,10 +28,12 @@ class RoombaRuntimeData:
     cloud_coordinator: RoombaCloudCoordinator = None
     cloud_platforms_loaded: bool = False
 
-    vacuum_mode: str = None
-    mop_mode: str = None
+    # Same defaults the Cleaning Mode / Mop Intensity selects show on startup;
+    # with None, _build_clean_params fell through to "mop" until a select was touched.
+    vacuum_mode: str = "vacuum"
+    mop_mode: str = "medium"
 
-    switched_rooms: dict[str, CleanRoomPasses] = {}
+    switched_rooms: dict[str, CleanRoomPasses]
 
     def __init__(
         self,
@@ -46,6 +48,9 @@ class RoombaRuntimeData:
         self.cloud_enabled = cloud_enabled
         self.cloud_coordinator = cloud_coordinator
         self.cloud_platforms_loaded = False
+        # Per entry: a class-level dict would be shared by every robot, so
+        # starting one robot could send another robot's selected rooms.
+        self.switched_rooms = {}
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

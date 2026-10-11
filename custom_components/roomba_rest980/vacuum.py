@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Any
 
 from homeassistant.components.vacuum import (
     StateVacuumEntity,
@@ -10,10 +11,18 @@ from homeassistant.components.vacuum import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    MOP_MODE_HIGH,
+    MOP_MODE_LOW,
+    MOP_MODE_MEDIUM,
+    OPERATING_MODE_MOP,
+    OPERATING_MODE_VACUUM,
+)
 from .LegacyCompatibility import createExtendedAttributes
 
 _LOGGER = logging.getLogger(__name__)
@@ -151,14 +160,18 @@ class RoombaVacuum(CoordinatorEntity, StateVacuumEntity):
         segments: list[Segment] = []
         self._segment_map.clear()
 
-        robot_data = self._entry.runtime_data.cloud_coordinator.data
-        if not robot_data or "pmaps" not in robot_data:
+        # The cloud coordinator holds every robot on the account, keyed by BLID.
+        cloud_coordinator = self._entry.runtime_data.cloud_coordinator
+        cloud_data = (cloud_coordinator.data or {}) if cloud_coordinator else {}
+        robot_data = cloud_data.get(self._entry.runtime_data.robot_blid) or {}
+        if "pmaps" not in robot_data:
             return segments
 
         for pmap in robot_data["pmaps"]:
             try:
                 details = pmap["active_pmapv_details"]
                 pmap_id = details["active_pmapv"]["pmap_id"]
+                user_pmapv_id = pmap.get("user_pmapv_id")
                 map_name = details["map_header"]["name"]
 
                 for region in details.get("regions", []):
@@ -171,6 +184,7 @@ class RoombaVacuum(CoordinatorEntity, StateVacuumEntity):
                         "type": "rid",
                         "region_id": region["id"],
                         "pmap_id": pmap_id,
+                        "user_pmapv_id": user_pmapv_id,
                     }
 
                 for zone in details.get("zones", []):
@@ -183,6 +197,7 @@ class RoombaVacuum(CoordinatorEntity, StateVacuumEntity):
                         "type": "zid",
                         "region_id": zone["id"],
                         "pmap_id": pmap_id,
+                        "user_pmapv_id": user_pmapv_id,
                     }
             except (KeyError, TypeError) as err:
                 _LOGGER.warning("Failed to parse pmap segments: %s", err)
@@ -203,6 +218,7 @@ class RoombaVacuum(CoordinatorEntity, StateVacuumEntity):
         params = self._build_clean_params()
 
         regions_by_pmap: dict[str, list[dict[str, Any]]] = {}
+        user_pmapv_ids: dict[str, str | None] = {}
         for seg_id in segment_ids:
             seg_data = self._segment_map.get(seg_id)
             if not seg_data:
@@ -222,22 +238,37 @@ class RoombaVacuum(CoordinatorEntity, StateVacuumEntity):
                 "params": params,
             }
             regions_by_pmap.setdefault(seg_data["pmap_id"], []).append(region)
+            user_pmapv_ids.setdefault(
+                seg_data["pmap_id"], seg_data.get("user_pmapv_id")
+            )
 
-        for pmap_id, regions in regions_by_pmap.items():
-            payload = {
-                "ordered": 1,
-                "pmap_id": pmap_id,
-                "regions": regions,
-            }
-            _LOGGER.info(
-                "Starting area clean: pmap=%s, regions=%s", pmap_id, regions
+        if not regions_by_pmap:
+            return
+        # A mission runs on one map; a second command would just replace the
+        # first, so cleaning rooms from two maps at once cannot be honoured.
+        if len(regions_by_pmap) > 1:
+            raise ServiceValidationError(
+                "The selected areas are on different maps; a Roomba can only "
+                "clean rooms from one map per run"
             )
-            await self.hass.services.async_call(
-                DOMAIN,
-                "rest980_clean",
-                payload,
-                blocking=True,
-            )
+
+        pmap_id, regions = next(iter(regions_by_pmap.items()))
+        payload = {
+            "ordered": 1,
+            "pmap_id": pmap_id,
+            "user_pmapv_id": user_pmapv_ids[pmap_id],
+            "regions": regions,
+        }
+        _LOGGER.info("Starting area clean: pmap=%s, regions=%s", pmap_id, regions)
+        await self.hass.services.async_call(
+            DOMAIN,
+            "rest980_clean",
+            service_data={
+                "payload": payload,
+                "base_url": self._entry.data["base_url"],
+            },
+            blocking=True,
+        )
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -310,6 +341,7 @@ class RoombaVacuum(CoordinatorEntity, StateVacuumEntity):
                 payload = {
                     "ordered": 1,
                     "pmap_id": selected_rooms[0].pmap_id,
+                    "user_pmapv_id": selected_rooms[0].user_pmapv_id,
                     "regions": regions,
                 }
 
